@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release
+
+override_dh_auto_install:
+	dh_auto_install
+	install -D -m 0644 config.ini \
+		debian/picam-orchestrator/etc/picam-orchestrator/config.ini
+
+override_dh_installsystemd:
+	dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade

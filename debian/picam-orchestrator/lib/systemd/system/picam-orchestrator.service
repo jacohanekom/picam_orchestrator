@@ -1,0 +1,29 @@
+[Unit]
+Description=Stream + camera control backend (picam-raw + picam-hailo)
+After=network.target picam-raw.service picam-hailo.service
+Wants=picam-raw.service picam-hailo.service
+
+[Service]
+Type=simple
+User=picam-orchestrator
+Group=picam-orchestrator
+
+# Grants just enough privilege to bind port 81 without running as root.
+# Required because the default http_port (81) is below 1024 and this
+# service runs as the unprivileged picam-orchestrator user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+ExecStart=/usr/bin/picam_orchestrator --config /etc/picam-orchestrator/config.ini
+
+Restart=on-failure
+RestartSec=3
+
+CPUAffinity=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=picam-orchestrator
+
+[Install]
+WantedBy=multi-user.target

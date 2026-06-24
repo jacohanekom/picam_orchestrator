@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if ! id picam-orchestrator >/dev/null 2>&1; then
+    useradd -r -s /usr/sbin/nologin picam-orchestrator || true
+fi
+
+systemctl daemon-reload || true
+
+echo ""
+echo "picam-orchestrator installed."
+echo "  Edit config  : /etc/picam-orchestrator/config.ini"
+echo "  Enable       : systemctl enable --now picam-orchestrator"
+echo "  Stream URL   : http://<pi-ip>:81/stream?stream=main (or lores, annotated)"
+echo "  Status URL   : http://<pi-ip>:81/status.json"
+echo ""
+echo "  This is a headless backend with no web UI. Install picam-frontend"
+echo "  on one machine to get a browser interface for one or more of these."

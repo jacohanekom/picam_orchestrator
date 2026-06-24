@@ -1,0 +1,199 @@
+picam-orchestrator (1.0.0+202606221547) stable; urgency=medium
+
+  * Major restructure: removed the separate "Annotated" stream.
+    Annotation (delay + detection boxes) is now an orthogonal,
+    independently toggleable flag on EITHER resolution (Lores or
+    Main), not a third stream of its own. StreamSource is now just
+    {Lores, Main}.
+  * Each resolution has its own delay buffer (mainDelayBuf,
+    loresDelayBuf), always drained regardless of whether annotation
+    is currently on, so flipping the toggle doesn't have to wait for
+    the buffer to refill before the first delayed frame is ready. A
+    client's existing connection seamlessly switches between live and
+    delayed+annotated when the flag changes — no reconnect needed.
+  * New GET /annotate?lores=true|false&main=true|false — independent
+    per-resolution toggles, global per-Pi (same viewer-of-that-
+    resolution-sees-the-same-thing model as the OSD toggle), no
+    restart needed. New config keys annotate.lores / annotate.main
+    (each default false) set the startup state.
+  * /status.json now reports lores_annotated and main_annotated
+    instead of a streams.annotated client count.
+  * Verified end-to-end against a real picam-raw protocol emulator:
+    connected a live Main viewer, toggled main annotation on mid-
+    stream, and confirmed the SAME connection kept receiving frames
+    (now delayed) with no reconnect — then connected Lores
+    independently and confirmed its own annotation state stayed
+    unaffected by Main's.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 15:47:26 +0000
+
+picam-orchestrator (1.0.0+202606221012) stable; urgency=medium
+
+  * Split the OSD burn-in into two independent toggles: camera ID
+    (bottom-left) and timestamp (bottom-right) can now be enabled or
+    disabled separately, instead of one combined flag controlling
+    both. New config keys osd.camera_id and osd.time (each default
+    false) replace osd.enabled as the startup defaults.
+  * GET /osd now accepts independent ?camera_id=true|false and
+    &time=true|false params. The legacy ?enabled=true|false is still
+    accepted for backward compatibility and sets both flags together.
+  * /status.json now reports camera_id_enabled and time_enabled
+    separately, replacing the single osd_enabled field.
+  * Verified by rendering all four enable/disable combinations
+    directly (both on, camera-id-only, time-only, both off) and
+    confirming each produces exactly the expected pixels with no
+    leftover background boxes from the disabled element. Also
+    verified the full three-tier HTTP chain: toggling one flag
+    through picam-frontend's proxy correctly leaves the other
+    untouched, confirmed by querying the backend directly.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 10:12:18 +0000
+
+picam-orchestrator (1.0.0+202606220935) stable; urgency=medium
+
+  * Changed default http_port from 80 to 81. Resolves the port
+    collision with picam-frontend (also defaulting to 80) when both
+    run on the same machine — the exact scenario that caused
+    picam-frontend to silently lose the bind() race and listen on a
+    random ephemeral port instead (fixed in the previous release).
+    Now the two services have non-overlapping defaults out of the
+    box: picam-orchestrator on 81, picam-frontend on 80.
+  * Updated all doc comments, startup log messages, config.ini, the
+    systemd service file's capability-grant comment, and postinst's
+    printed URLs to reflect port 81.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 09:35:47 +0000
+
+picam-orchestrator (1.0.0+202606220931) stable; urgency=high
+
+  * Fixed the same unchecked-bind() bug found and fixed in
+    picam-frontend: MjpegHttpServer::start() and StatusServer::loop()
+    both ignored bind()'s return value, meaning a port conflict
+    (e.g. with another instance, or any other process already using
+    http_port/status_port) silently moved the listening socket to a
+    random ephemeral port while still logging the configured port as
+    if everything were fine. MjpegHttpServer now logs a FATAL message
+    with the OS error and exits with status 1; StatusServer (which
+    runs on a detached thread) logs the same FATAL and just stops
+    that one server rather than killing the whole process.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 09:31:14 +0000
+
+picam-orchestrator (1.0.0+202606220901) stable; urgency=low
+
+  * Renamed from picam-stream to picam-orchestrator (package, binary,
+    paths, service, config directory all updated). Reflects that this
+    package now does more than stream — it also proxies OSD toggling
+    and camera switching to picam-raw, "orchestrating" the pipeline
+    rather than just relaying frames.
+  * Updated package description and systemd service description to
+    mention all four capabilities (streaming, status, OSD, camera
+    switch) instead of just streaming.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 09:01:20 +0000
+
+picam-stream (1.0.0+202606220858) stable; urgency=low
+
+  * Added GET /camera?id=N — switches picam-raw's active camera by
+    proxying to its existing CommandServer protocol ("switch<N>\n" on
+    TCP port 8556 by default, configurable via telemetry.command_port).
+    Lets picam-frontend offer a camera-switch button without speaking
+    picam-raw's plain-text TCP protocol directly — it only ever talks
+    HTTP to picam-stream. Response passes through picam-raw's own
+    JSON verbatim (ok/active_camera/label or ok:false/error), with
+    the HTTP status distinguishing reach-failures (502) from
+    picam-raw successfully responding (200, even for a rejected
+    switch like an unconfigured camera index).
+  * Verified end-to-end with a fake picam-raw CommandServer
+    implementing the real protocol: confirmed successful switches,
+    rejected invalid camera indices, and missing ?id= all produce the
+    correct HTTP status and JSON body.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 08:58:40 +0000
+
+picam-stream (1.0.0+202606220805) stable; urgency=low
+
+  * Added frame_ts_us to /status.json — the embedded timestamp (Unix
+    microseconds) from the most recently encoded frame, taken from
+    picam-raw's own clock as carried in every UDP chunk-0 header. This
+    is NOT this Pi's or the viewer's wall-clock time. Lets the web UI
+    show the camera feed's actual time instead of guessing from local
+    clocks. PipelineStatus (already tracking frames_in/out/clients)
+    moved earlier in the file so MjpegHttpServer's /status.json
+    handler can read latest_frame_ts_us from it directly.
+  * Verified end-to-end with a protocol-correct fake picam-raw backend
+    (replies to the HELLO registration ping, as real picam-raw does)
+    sending frames stamped with a deliberately distinctive timestamp
+    (2030-01-01) — confirmed it round-trips correctly through
+    /status.json's frame_ts_us field exactly as sent.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 08:05:04 +0000
+
+picam-stream (1.0.0+202606220744) stable; urgency=high
+
+  * Added on-the-fly OSD toggle: GET /osd?enabled=true|false flips the
+    camera-ID/timestamp burn-in instantly, no config edit or restart
+    needed. Global per-Pi — affects every connected viewer and every
+    stream (Main/Lores/Annotated). osd.enabled in config.ini is now
+    only the startup default; the running state is tracked in a
+    global atomic and can change at any time via the new endpoint.
+  * /status.json now reports osd_enabled so any UI can show current
+    state without guessing.
+  * Fixed a clean-shutdown hang in UdpRawReceiver: its UDP socket had
+    no SO_RCVTIMEO, so recvLoop's recv() call could block forever
+    whenever picam-raw went quiet. close()ing the socket from the
+    destructor does not reliably unblock a thread already parked
+    inside recv() on a UDP socket — confirmed via gdb thread dump:
+    main() was stuck in ~UdpRawReceiver()'s join() with the recv
+    thread still sitting in recv(). Fixed with the same 1s timeout
+    pattern already used for DetectionReceiver/TelemetryReceiver.
+    Verified: shutdown went from hanging past 30+ seconds to exiting
+    within 2 seconds.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Mon, 22 Jun 2026 07:44:38 +0000
+
+picam-stream (1.0.0+202606220727) stable; urgency=low
+
+  * Added an optional OSD burn-in: camera ID (bottom-left) + wall-clock
+    timestamp (bottom-right) drawn directly into the video frame pixels
+    via the same 5x7 bitmap font already used by the detection-box
+    annotator. Applies to all three streams (main, lores, annotated).
+    Off by default — enable via [osd] enabled=true in config.ini.
+  * Camera labels are configurable per index (osd.camera_labels =
+    Front,Back) for readability; falls back to the bare numeric index
+    if unset.
+  * Verified with a standalone pixel-level test: confirmed the burn-in
+    only touches the intended bottom-left/bottom-right corner regions
+    and leaves the rest of the frame (including the exact center)
+    completely untouched.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Sat, 20 Jun 2026 07:15:00 +0000
+
+picam-stream (1.0.0+202606200640) stable; urgency=high
+
+  * Fixed a clean-shutdown bug found while testing picam-frontend's
+    proxy logic against this same accept-loop pattern: close()ing the
+    listening socket does NOT reliably unblock another thread that is
+    parked inside accept() on that fd. Confirmed via gdb — the accept
+    thread stayed in accept() even after close() ran, leaving the
+    destructor's acceptThread_.join() to hang forever. Fixed by calling
+    shutdown(fd, SHUT_RDWR) before close() — shutdown() does force a
+    blocked accept() call to return with an error.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Sat, 20 Jun 2026 06:45:00 +0000
+
+picam-stream (1.0.0+202606200626) stable; urgency=low
+
+  * Renamed from picam-web to picam-stream and split into a headless
+    backend with no web UI of its own. Removed the / and /index.html
+    HTML-serving routes entirely — this package now serves only
+    /stream?stream=main|lores|annotated and /status.json.
+  * Install picam-frontend on a separate machine (or any one Pi) to
+    get a browser interface that can view and switch between multiple
+    picam-stream backends from a single page.
+  * Carries forward the lock-free client-list redesign from picam-web:
+    the hot per-frame encode loop never touches a mutex when reading
+    the connected-client list, eliminating the lock-contention hangs
+    chased through several earlier picam-web releases.
+
+ -- Jaco Hanekom <jhanekom@gmail.com>  Sat, 20 Jun 2026 06:26:24 +0000

@@ -1,0 +1,4 @@
+cd65cb4924f6bf05d0da2db7b8576f23  lib/systemd/system/picam-orchestrator.service
+b37234f2423d860fc2d57c5d0cbb1f0e  usr/bin/picam_orchestrator
+ca052fd2665c2b08afadee3c8b194738  usr/share/doc/picam-orchestrator/changelog.gz
+cec30e9f2917e1c12c8f42714d7979f8  usr/share/doc/picam-orchestrator/copyright

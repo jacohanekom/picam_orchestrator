@@ -1,0 +1,24 @@
+Package: picam-orchestrator
+Version: 1.0.0+202606221547
+Architecture: arm64
+Maintainer: Jaco Hanekom <jhanekom@gmail.com>
+Installed-Size: 161
+Depends: libc6 (>= 2.34), libgcc-s1 (>= 3.0), libjpeg62-turbo (>= 1.3.1), libstdc++6 (>= 11), picam-raw, picam-hailo
+Section: video
+Priority: optional
+Description: MJPEG stream + camera control backend for picam-raw + picam-hailo
+ Headless backend exposing Main / Lores / Annotated MJPEG streams over
+ plain HTTP (/stream?stream=main|lores|annotated), a JSON status
+ endpoint (/status.json), an on-the-fly OSD toggle (/osd), and a
+ camera-switch proxy to picam-raw (/camera?id=N). No web interface of
+ its own. Each connected client selects its stream independently.
+ Main and Lores are live feeds straight from picam-raw; Annotated
+ buffers the main stream for ~1 second, matches detections from
+ picam-hailo by timestamp, and draws bounding boxes onto the delayed
+ frames.
+ .
+ Install picam-frontend on one machine to get a browser UI that can
+ view, switch streams/cameras, and toggle the OSD across multiple
+ picam-orchestrator backends (e.g. several Pis) from one page.
+ .
+ Config: /etc/picam-orchestrator/config.ini
