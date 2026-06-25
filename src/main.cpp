@@ -156,7 +156,8 @@ struct Detection {
     float conf, x0, y0, x1, y1;  // normalised [0,1] relative to model input frame
 };
 struct DetectionEvent {
-    int64_t ts_us = 0;
+    int64_t  ts_us     = 0;
+    uint32_t frame_seq = 0;
     std::vector<Detection> dets;
 };
 
@@ -373,7 +374,8 @@ static bool parse_event(const std::string& line, DetectionEvent& out) {
     auto detPos = line.find("\"detections\":[");
     if (detPos == std::string::npos) return false;
 
-    out.ts_us = extract_int64(line, "ts_us");
+    out.ts_us     = extract_int64(line, "ts_us");
+    out.frame_seq = static_cast<uint32_t>(extract_int64(line, "frame_seq"));
     out.dets.clear();
 
     size_t pos = detPos + 14;
@@ -535,8 +537,12 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 class DetectionReceiver {
 public:
-    DetectionReceiver(std::string host, int port, DetectionBuffer& buf)
-        : host_(std::move(host)), port_(port), buf_(buf) {}
+    using OnEvent = std::function<void(const DetectionEvent&)>;
+
+    DetectionReceiver(std::string host, int port, DetectionBuffer& buf,
+                      OnEvent onEvent = nullptr)
+        : host_(std::move(host)), port_(port), buf_(buf)
+        , onEvent_(std::move(onEvent)) {}
 
     ~DetectionReceiver() {
         if (thread_.joinable()) thread_.join();
@@ -587,8 +593,10 @@ private:
                     std::string line = lineBuf.substr(0, nl);
                     lineBuf.erase(0, nl + 1);
                     DetectionEvent evt;
-                    if (minijson::parse_event(line, evt))
+                    if (minijson::parse_event(line, evt)) {
+                        if (onEvent_ && !evt.dets.empty()) onEvent_(evt);
                         buf_.push(std::move(evt));
+                    }
                 }
             }
             ::close(fd);
@@ -598,9 +606,251 @@ private:
     }
 
     std::string      host_;
-    int               port_;
-    DetectionBuffer&  buf_;
-    std::thread       thread_;
+    int              port_;
+    DetectionBuffer& buf_;
+    OnEvent          onEvent_;
+    std::thread      thread_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UUID generator — tries /proc/sys/kernel/random/uuid first (Linux), then
+// falls back to reading 16 bytes from /dev/urandom and formatting as v4.
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string generateUUID() {
+    {
+        std::ifstream f("/proc/sys/kernel/random/uuid");
+        if (f) {
+            std::string s;
+            std::getline(f, s);
+            while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
+                s.pop_back();
+            if (s.size() == 36) return s;
+        }
+    }
+    uint8_t b[16] = {};
+    { std::ifstream u("/dev/urandom", std::ios::binary); u.read(reinterpret_cast<char*>(b), 16); }
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    char buf[37];
+    std::snprintf(buf, sizeof(buf),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
+    return buf;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recorder TCP helpers — one-shot connect/send/recv/close per command.
+// picam-recorder's control protocol: plain-text "start <name>\n", "stop\n".
+// Response: key=value lines terminated by a blank line.
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string recorderCommand(const std::string& host, int port,
+                                   const std::string& cmd) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return "";
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(static_cast<uint16_t>(port));
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        ::close(fd); return "";
+    }
+
+    // 3-second non-blocking connect
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    ::connect(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    fd_set wfds; FD_ZERO(&wfds); FD_SET(fd, &wfds);
+    timeval tv{3, 0};
+    if (::select(fd + 1, nullptr, &wfds, nullptr, &tv) <= 0) {
+        ::close(fd); return "";
+    }
+    ::fcntl(fd, F_SETFL, flags);
+
+    std::string line = cmd + "\n";
+    if (::send(fd, line.data(), line.size(), MSG_NOSIGNAL) < 0) {
+        ::close(fd); return "";
+    }
+
+    // Read until blank line (\n\n) or timeout
+    timeval rtv{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+    std::string resp;
+    char buf[512];
+    while (resp.find("\n\n") == std::string::npos) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        resp.append(buf, static_cast<size_t>(n));
+    }
+    ::close(fd);
+    return resp;
+}
+
+// Returns the file path reported by the recorder, or empty on error.
+static std::string recorderStart(const std::string& host, int port,
+                                 const std::string& name) {
+    std::string resp = recorderCommand(host, port, "start " + name);
+    auto pos = resp.find("file=");
+    if (pos == std::string::npos) return "";
+    auto end = resp.find('\n', pos + 5);
+    return resp.substr(pos + 5,
+                       end == std::string::npos ? std::string::npos : end - (pos + 5));
+}
+
+static void recorderStop(const std::string& host, int port) {
+    recorderCommand(host, port, "stop");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EventRecorder — triggers picam-recorder when detections are active, collects
+// the detection events, and writes them as <recording>.events.json when
+// recording ends (after idle_secs of silence).
+// ─────────────────────────────────────────────────────────────────────────────
+class EventRecorder {
+public:
+    EventRecorder(std::string host, int port, int idleSecs)
+        : host_(std::move(host)), port_(port), idleSecs_(idleSecs)
+    {
+        thread_ = std::thread([this]{ loop(); });
+    }
+
+    ~EventRecorder() {
+        shutdown_ = true;
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    // Called from any thread when a non-empty detection arrives.
+    void notify(const DetectionEvent& evt) {
+        std::lock_guard<std::mutex> lk(mu_);
+        lastSeen_   = Clock::now();
+        haveEvents_ = true;
+        accumulated_.push_back(evt);
+        cv_.notify_all();
+    }
+
+private:
+    static int64_t nowUs() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    void loop() {
+        while (!shutdown_) {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait_for(lk, std::chrono::seconds(1));
+            if (shutdown_) break;
+
+            if (haveEvents_ && !recording_) {
+                // Start a new recording
+                std::string uuid = generateUUID();
+                int64_t startedUs = nowUs();
+                lk.unlock();
+                std::string file = recorderStart(host_, port_, uuid);
+                lk.lock();
+                if (!file.empty()) {
+                    recording_   = true;
+                    currentFile_ = file;
+                    startedUs_   = startedUs;
+                    std::cerr << "[EventRecorder] Started: " << file << "\n";
+                } else {
+                    std::cerr << "[EventRecorder] Failed to start recorder\n";
+                    accumulated_.clear();
+                    haveEvents_ = false;
+                }
+            }
+
+            if (recording_) {
+                auto idleUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now() - lastSeen_).count();
+                if (idleUs >= static_cast<int64_t>(idleSecs_) * 1'000'000LL) {
+                    flush(lk);
+                }
+            }
+        }
+
+        // Drain on shutdown
+        std::unique_lock<std::mutex> lk(mu_);
+        if (recording_) flush(lk);
+    }
+
+    // Must be called with mu_ held; releases and re-acquires it around I/O.
+    void flush(std::unique_lock<std::mutex>& lk) {
+        std::string file        = currentFile_;
+        auto        events      = std::move(accumulated_);
+        int64_t     startedUs   = startedUs_;
+        recording_   = false;
+        currentFile_ = "";
+        haveEvents_  = false;
+        lk.unlock();
+
+        recorderStop(host_, port_);
+        saveEvents(file, events, startedUs);
+
+        lk.lock();
+    }
+
+    void saveEvents(const std::string& mp4path,
+                    const std::vector<DetectionEvent>& events,
+                    int64_t startedUs) {
+        // Place .events.json alongside the MP4
+        std::string jsonPath = mp4path;
+        auto dot = jsonPath.rfind('.');
+        if (dot != std::string::npos) jsonPath.resize(dot);
+        jsonPath += ".events.json";
+
+        std::ofstream f(jsonPath);
+        if (!f) {
+            std::cerr << "[EventRecorder] Cannot write: " << jsonPath << "\n";
+            return;
+        }
+
+        int64_t stoppedUs = nowUs();
+        f << std::fixed << std::setprecision(4);
+        f << "{\n"
+          << "  \"recording\": \"" << mp4path << "\",\n"
+          << "  \"started_us\": " << startedUs << ",\n"
+          << "  \"stopped_us\": " << stoppedUs << ",\n"
+          << "  \"events\": [\n";
+        for (size_t i = 0; i < events.size(); ++i) {
+            const auto& e = events[i];
+            f << "    {\"ts_us\": " << e.ts_us
+              << ", \"frame_seq\": " << e.frame_seq
+              << ", \"detections\": [";
+            for (size_t j = 0; j < e.dets.size(); ++j) {
+                const auto& d = e.dets[j];
+                if (j) f << ", ";
+                f << "{\"class\": \"" << d.cls << "\""
+                  << ", \"conf\": " << d.conf
+                  << ", \"x0\": " << d.x0
+                  << ", \"y0\": " << d.y0
+                  << ", \"x1\": " << d.x1
+                  << ", \"y1\": " << d.y1 << "}";
+            }
+            f << "]}";
+            if (i + 1 < events.size()) f << ",";
+            f << "\n";
+        }
+        f << "  ]\n}\n";
+        std::cerr << "[EventRecorder] Saved: " << jsonPath
+                  << " (" << events.size() << " detection events)\n";
+    }
+
+    std::string host_;
+    int         port_;
+    int         idleSecs_;
+
+    std::mutex              mu_;
+    std::condition_variable cv_;
+    std::thread             thread_;
+    std::atomic<bool>       shutdown_{false};
+
+    bool                         recording_   = false;
+    bool                         haveEvents_  = false;
+    std::string                  currentFile_;
+    std::vector<DetectionEvent>  accumulated_;
+    Clock::time_point            lastSeen_;
+    int64_t                      startedUs_   = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1651,6 +1901,10 @@ int main(int argc, char** argv) {
     const int         det_port     = cfg.get_int("detections.port", 8558);
     const int         tolerance_ms = cfg.get_int("detections.tolerance_ms", 150);
 
+    const std::string rec_host     = cfg.get_str("recorder.host", "127.0.0.1");
+    const int         rec_port     = cfg.get_int("recorder.port", 8080);
+    const int         rec_idle     = cfg.get_int("recorder.idle_secs", 30);
+
     const std::string tel_host     = cfg.get_str("telemetry.host", "127.0.0.1");
     const int         tel_port     = cfg.get_int("telemetry.port", 8555);
     // picam-raw's CommandServer — same host as telemetry (both are
@@ -1710,6 +1964,8 @@ int main(int argc, char** argv) {
               << "  " << lores_width << "x" << lores_height << "\n"
               << "[Config] detections: tcp://" << det_host << ":" << det_port
               << "  tolerance=" << tolerance_ms << "ms\n"
+              << "[Config] recorder  : tcp://" << rec_host << ":" << rec_port
+              << "  idle=" << rec_idle << "s\n"
               << "[Config] telemetry : tcp://" << tel_host << ":" << tel_port << "\n"
               << "[Config] delay     : " << delay_ms << "ms (applied to whichever resolution has annotation on)\n"
               << "[Config] encode    : jpeg quality=" << jpeg_quality
@@ -1784,7 +2040,9 @@ int main(int argc, char** argv) {
         });
 
     DetectionBuffer detBuf(delay_ms + tolerance_ms + 2000);
-    DetectionReceiver detReceiver(det_host, det_port, detBuf);
+    EventRecorder evtRec(rec_host, rec_port, rec_idle);
+    DetectionReceiver detReceiver(det_host, det_port, detBuf,
+        [&evtRec](const DetectionEvent& e){ evtRec.notify(e); });
     TelemetryReceiver telReceiver(tel_host, tel_port);
 
     StatusServer status_srv(status_port);
