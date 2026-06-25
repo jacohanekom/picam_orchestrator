@@ -708,8 +708,12 @@ static void recorderStop(const std::string& host, int port) {
 // ─────────────────────────────────────────────────────────────────────────────
 class EventRecorder {
 public:
-    EventRecorder(std::string host, int port)
-        : host_(std::move(host)), port_(port)
+    // Called with the triggering DetectionEvent; returns JPEG bytes to save,
+    // or empty to skip the snapshot.
+    using SnapshotFn = std::function<std::vector<uint8_t>(const DetectionEvent&)>;
+
+    EventRecorder(std::string host, int port, SnapshotFn snapshotFn = nullptr)
+        : host_(std::move(host)), port_(port), snapshotFn_(std::move(snapshotFn))
     {
         thread_ = std::thread([this]{ loop(); });
     }
@@ -749,11 +753,29 @@ private:
             if (shutdown_) break;
 
             if (haveEvents_ && !recording_) {
-                // Start a new recording
                 std::string uuid = generateUUID();
                 int64_t startedUs = nowUs();
+                // Grab the trigger event before releasing the lock for I/O below.
+                DetectionEvent triggerEvt = accumulated_.empty()
+                    ? DetectionEvent{} : accumulated_.front();
                 lk.unlock();
+
                 std::string file = recorderStart(host_, port_, uuid);
+
+                if (!file.empty() && snapshotFn_ && !triggerEvt.dets.empty()) {
+                    auto jpeg = snapshotFn_(triggerEvt);
+                    if (!jpeg.empty()) {
+                        std::string imgPath = file;
+                        auto dot = imgPath.rfind('.');
+                        if (dot != std::string::npos) imgPath.resize(dot);
+                        imgPath += ".jpg";
+                        std::ofstream imgf(imgPath, std::ios::binary);
+                        imgf.write(reinterpret_cast<const char*>(jpeg.data()),
+                                   static_cast<std::streamsize>(jpeg.size()));
+                        std::cerr << "[EventRecorder] Snapshot: " << imgPath << "\n";
+                    }
+                }
+
                 lk.lock();
                 if (!file.empty()) {
                     recording_   = true;
@@ -891,8 +913,9 @@ private:
                   << " (" << events.size() << " events)\n";
     }
 
-    std::string host_;
-    int         port_;
+    std::string  host_;
+    int          port_;
+    SnapshotFn   snapshotFn_;
 
     std::mutex              mu_;
     std::condition_variable cv_;
@@ -2092,7 +2115,18 @@ int main(int argc, char** argv) {
         });
 
     DetectionBuffer detBuf(delay_ms + tolerance_ms + 2000);
-    EventRecorder evtRec(rec_host, rec_port);
+    EventRecorder evtRec(rec_host, rec_port,
+        [&](const DetectionEvent& evt) -> std::vector<uint8_t> {
+            RawFrame frame;
+            {
+                std::lock_guard<std::mutex> lk(mainMu);
+                if (!mainHas) return {};
+                frame = mainLatest;
+            }
+            annot::annotate(frame.data.data(), frame.width, frame.height, evt.dets);
+            JpegEncoder enc(jpeg_quality);
+            return enc.encode(frame.data.data(), frame.width, frame.height);
+        });
     DetectionReceiver detReceiver(det_host, det_port, detBuf,
         [&evtRec](const DetectionEvent& e){ evtRec.notify(e); });
     TelemetryReceiver telReceiver(tel_host, tel_port);
