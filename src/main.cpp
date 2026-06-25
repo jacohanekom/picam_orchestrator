@@ -594,7 +594,7 @@ private:
                     lineBuf.erase(0, nl + 1);
                     DetectionEvent evt;
                     if (minijson::parse_event(line, evt)) {
-                        if (onEvent_ && !evt.dets.empty()) onEvent_(evt);
+                        if (onEvent_) onEvent_(evt);
                         buf_.push(std::move(evt));
                     }
                 }
@@ -708,8 +708,8 @@ static void recorderStop(const std::string& host, int port) {
 // ─────────────────────────────────────────────────────────────────────────────
 class EventRecorder {
 public:
-    EventRecorder(std::string host, int port, int idleSecs)
-        : host_(std::move(host)), port_(port), idleSecs_(idleSecs)
+    EventRecorder(std::string host, int port)
+        : host_(std::move(host)), port_(port)
     {
         thread_ = std::thread([this]{ loop(); });
     }
@@ -720,10 +720,17 @@ public:
         if (thread_.joinable()) thread_.join();
     }
 
-    // Called from any thread when a non-empty detection arrives.
+    // Called from any thread for every detection event, empty or not.
+    // Non-empty dets start/continue a recording; empty dets stop it immediately.
     void notify(const DetectionEvent& evt) {
         std::lock_guard<std::mutex> lk(mu_);
-        lastSeen_   = Clock::now();
+        if (evt.dets.empty()) {
+            if (recording_) {
+                stopRequested_ = true;
+                cv_.notify_all();
+            }
+            return;
+        }
         haveEvents_ = true;
         accumulated_.push_back(evt);
         cv_.notify_all();
@@ -760,12 +767,9 @@ private:
                 }
             }
 
-            if (recording_) {
-                auto idleUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                    Clock::now() - lastSeen_).count();
-                if (idleUs >= static_cast<int64_t>(idleSecs_) * 1'000'000LL) {
-                    flush(lk);
-                }
+            if (recording_ && stopRequested_) {
+                stopRequested_ = false;
+                flush(lk);
             }
         }
 
@@ -793,64 +797,114 @@ private:
     void saveEvents(const std::string& mp4path,
                     const std::vector<DetectionEvent>& events,
                     int64_t startedUs) {
-        // Place .events.json alongside the MP4
         std::string jsonPath = mp4path;
         auto dot = jsonPath.rfind('.');
         if (dot != std::string::npos) jsonPath.resize(dot);
         jsonPath += ".events.json";
 
-        std::ofstream f(jsonPath);
-        if (!f) {
-            std::cerr << "[EventRecorder] Cannot write: " << jsonPath << "\n";
+        auto writeEventLines = [&](std::ostream& f) {
+            for (size_t i = 0; i < events.size(); ++i) {
+                const auto& e = events[i];
+                f << "    {\"ts_us\": " << e.ts_us
+                  << ", \"frame_seq\": " << e.frame_seq
+                  << ", \"detections\": [";
+                for (size_t j = 0; j < e.dets.size(); ++j) {
+                    const auto& d = e.dets[j];
+                    if (j) f << ", ";
+                    f << "{\"class\": \"" << d.cls << "\""
+                      << ", \"conf\": " << d.conf
+                      << ", \"x0\": " << d.x0
+                      << ", \"y0\": " << d.y0
+                      << ", \"x1\": " << d.x1
+                      << ", \"y1\": " << d.y1 << "}";
+                }
+                f << "]}";
+                if (i + 1 < events.size()) f << ",";
+                f << "\n";
+            }
+        };
+
+        if (!std::filesystem::exists(jsonPath)) {
+            std::ofstream f(jsonPath);
+            if (!f) {
+                std::cerr << "[EventRecorder] Cannot write: " << jsonPath << "\n";
+                return;
+            }
+            f << std::fixed << std::setprecision(4);
+            f << "{\n"
+              << "  \"recording\": \"" << mp4path << "\",\n"
+              << "  \"started_us\": " << startedUs << ",\n"
+              << "  \"events\": [\n";
+            writeEventLines(f);
+            f << "  ]\n}\n";
+            std::cerr << "[EventRecorder] Created: " << jsonPath
+                      << " (" << events.size() << " events)\n";
             return;
         }
 
-        int64_t stoppedUs = nowUs();
-        f << std::fixed << std::setprecision(4);
-        f << "{\n"
-          << "  \"recording\": \"" << mp4path << "\",\n"
-          << "  \"started_us\": " << startedUs << ",\n"
-          << "  \"stopped_us\": " << stoppedUs << ",\n"
-          << "  \"events\": [\n";
-        for (size_t i = 0; i < events.size(); ++i) {
-            const auto& e = events[i];
-            f << "    {\"ts_us\": " << e.ts_us
-              << ", \"frame_seq\": " << e.frame_seq
-              << ", \"detections\": [";
-            for (size_t j = 0; j < e.dets.size(); ++j) {
-                const auto& d = e.dets[j];
-                if (j) f << ", ";
-                f << "{\"class\": \"" << d.cls << "\""
-                  << ", \"conf\": " << d.conf
-                  << ", \"x0\": " << d.x0
-                  << ", \"y0\": " << d.y0
-                  << ", \"x1\": " << d.x1
-                  << ", \"y1\": " << d.y1 << "}";
-            }
-            f << "]}";
-            if (i + 1 < events.size()) f << ",";
-            f << "\n";
+        // File exists — splice new events in before the closing  ]\n}\n.
+        //
+        // The file always ends with the 6-byte tail "  ]\n}\n". The byte at
+        // position -(tailLen+2) from EOF distinguishes two cases:
+        //   '}' → existing events in array, need a comma before the new ones.
+        //         Truncate 7 bytes (removes the trailing \n too) so the file
+        //         ends at the last event's closing }, then write ,\n + new events.
+        //   '[' → events array was empty, no comma needed.
+        //         Truncate 6 bytes, file ends at the opening [\n, write directly.
+        const std::streamoff kTailLen   = 6;  // "  ]\n}\n"
+        const std::streamoff kProbeBack = kTailLen + 2;
+
+        auto fileSize = static_cast<std::streamoff>(std::filesystem::file_size(jsonPath));
+        if (fileSize < kProbeBack) {
+            std::cerr << "[EventRecorder] File too small to append, skipping: " << jsonPath << "\n";
+            return;
         }
+
+        char discriminator = '\0';
+        {
+            std::ifstream probe(jsonPath, std::ios::binary);
+            probe.seekg(-kProbeBack, std::ios::end);
+            probe.get(discriminator);
+        }
+
+        bool needComma = (discriminator != '[');
+        std::error_code ec;
+        std::filesystem::resize_file(
+            jsonPath,
+            static_cast<std::uintmax_t>(fileSize - kTailLen - (needComma ? 1 : 0)),
+            ec);
+        if (ec) {
+            std::cerr << "[EventRecorder] resize_file failed: " << ec.message() << "\n";
+            return;
+        }
+
+        std::ofstream f(jsonPath, std::ios::app);
+        if (!f) {
+            std::cerr << "[EventRecorder] Cannot append: " << jsonPath << "\n";
+            return;
+        }
+        f << std::fixed << std::setprecision(4);
+        if (needComma) f << ",\n";
+        writeEventLines(f);
         f << "  ]\n}\n";
-        std::cerr << "[EventRecorder] Saved: " << jsonPath
-                  << " (" << events.size() << " detection events)\n";
+        std::cerr << "[EventRecorder] Appended: " << jsonPath
+                  << " (" << events.size() << " events)\n";
     }
 
     std::string host_;
     int         port_;
-    int         idleSecs_;
 
     std::mutex              mu_;
     std::condition_variable cv_;
     std::thread             thread_;
     std::atomic<bool>       shutdown_{false};
 
-    bool                         recording_   = false;
-    bool                         haveEvents_  = false;
+    bool                         recording_     = false;
+    bool                         haveEvents_    = false;
+    bool                         stopRequested_ = false;
     std::string                  currentFile_;
     std::vector<DetectionEvent>  accumulated_;
-    Clock::time_point            lastSeen_;
-    int64_t                      startedUs_   = 0;
+    int64_t                      startedUs_     = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1903,7 +1957,6 @@ int main(int argc, char** argv) {
 
     const std::string rec_host     = cfg.get_str("recorder.host", "127.0.0.1");
     const int         rec_port     = cfg.get_int("recorder.port", 8080);
-    const int         rec_idle     = cfg.get_int("recorder.idle_secs", 30);
 
     const std::string tel_host     = cfg.get_str("telemetry.host", "127.0.0.1");
     const int         tel_port     = cfg.get_int("telemetry.port", 8555);
@@ -1964,8 +2017,7 @@ int main(int argc, char** argv) {
               << "  " << lores_width << "x" << lores_height << "\n"
               << "[Config] detections: tcp://" << det_host << ":" << det_port
               << "  tolerance=" << tolerance_ms << "ms\n"
-              << "[Config] recorder  : tcp://" << rec_host << ":" << rec_port
-              << "  idle=" << rec_idle << "s\n"
+              << "[Config] recorder  : tcp://" << rec_host << ":" << rec_port << "\n"
               << "[Config] telemetry : tcp://" << tel_host << ":" << tel_port << "\n"
               << "[Config] delay     : " << delay_ms << "ms (applied to whichever resolution has annotation on)\n"
               << "[Config] encode    : jpeg quality=" << jpeg_quality
@@ -2040,7 +2092,7 @@ int main(int argc, char** argv) {
         });
 
     DetectionBuffer detBuf(delay_ms + tolerance_ms + 2000);
-    EventRecorder evtRec(rec_host, rec_port, rec_idle);
+    EventRecorder evtRec(rec_host, rec_port);
     DetectionReceiver detReceiver(det_host, det_port, detBuf,
         [&evtRec](const DetectionEvent& e){ evtRec.notify(e); });
     TelemetryReceiver telReceiver(tel_host, tel_port);
