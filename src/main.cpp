@@ -519,7 +519,7 @@ public:
         for (const auto& e : events_) {
             int64_t diff = std::abs(e.ts_us - target_ts_us);
             if (diff < bestDiff) { bestDiff = diff; out = e; found = true; }
-        }jaco
+        }
         return found && bestDiff <= toleranceUs;
     }
 
