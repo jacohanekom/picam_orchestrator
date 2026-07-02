@@ -6,18 +6,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "")
 
 find_package(JPEG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(WEBP REQUIRED libwebp)
 
 message(STATUS "libjpeg : ${JPEG_LIBRARIES}")
+message(STATUS "libwebp : ${WEBP_LIBRARIES}")
 
 add_executable(picam_orchestrator src/main.cpp)
 
 target_include_directories(picam_orchestrator PRIVATE
         src
     ${JPEG_INCLUDE_DIRS}
+    ${WEBP_INCLUDE_DIRS}
 )
 
 target_link_libraries(picam_orchestrator PRIVATE
     ${JPEG_LIBRARIES}
+    ${WEBP_LIBRARIES}
     pthread
 )
 

@@ -3,10 +3,16 @@
  * ============
  * Delays the raw main YUV420 stream from picam-raw by ~1 second, draws
  * detection boxes from picam-hailo onto the delayed frames (matched by
- * timestamp), encodes to JPEG, and streams live to any browser as MJPEG
- * over plain HTTP. No signaling, no negotiation, no extra protocol —
- * just <img src="/stream"> which every browser has supported natively
- * for decades.
+ * timestamp), encodes to WebP, and streams live to any browser as a
+ * motion-WebP sequence over plain HTTP. No signaling, no negotiation, no
+ * extra protocol — just <img src="/stream"> which every browser has
+ * supported natively for decades; only the per-frame image codec inside
+ * the multipart response changed (from JPEG to WebP, for smaller frames
+ * at equivalent quality — see WebpEncoder below).
+ *
+ * Event snapshots saved to disk by EventRecorder are still plain JPEG
+ * (JpegEncoder, unchanged) — those are one-off files meant for viewing/
+ * archival, not a bandwidth-sensitive live stream.
  *
  * Pipeline:
  *
@@ -24,10 +30,10 @@
  *   Annotator — draws boxes into YUV420 Y-plane
  *       │
  *       ▼
- *   JpegEncoder (libjpeg)
+ *   WebpEncoder (libwebp)
  *       │
  *       ▼
- *   MjpegHttpServer — multipart/x-mixed-replace over HTTP
+ *   StreamHttpServer — multipart/x-mixed-replace over HTTP
  *       ▼
  *   Browser  (open http://<pi-ip>:81, or via picam-frontend on port 80)
  *
@@ -96,7 +102,7 @@ static std::atomic<bool> g_main_annotated{false};
 
 // picam-raw's address for camera-switch commands. Set once in main()
 // from config (telemetry.host / telemetry.command_port) before
-// MjpegHttpServer starts — read-only after that, so no synchronization
+// StreamHttpServer starts — read-only after that, so no synchronization
 // is needed despite being read from request-handling threads.
 static std::string g_picamraw_host = "127.0.0.1";
 static int         g_picamraw_cmd_port = 8556;
@@ -1125,7 +1131,7 @@ void annotate(uint8_t* yPlane, int w, int h, const std::vector<Detection>& dets)
 // font table and pixel-drawing primitives (setY/drawChar) rather than
 // duplicating the bitmap font a third time in this codebase — this is
 // the same visual style as picam-recorder's OSD, ported here so the live
-// MJPEG streams can carry the same camera ID + timestamp burn-in.
+// streams can carry the same camera ID + timestamp burn-in.
 // Off by default; enabled via [osd] in config.ini.
 // ─────────────────────────────────────────────────────────────────────────────
 namespace osd {
@@ -1295,13 +1301,89 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MjpegHttpServer
+// WebpEncoder — libwebp, encodes packed YUV420 directly (no RGB round
+// trip, same trick as JpegEncoder above) for the live browser stream.
+// WebP is intra-only per frame just like JPEG — no motion estimation
+// between frames, so CPU cost stays comparable — but its extra
+// prediction modes and better entropy coding buy roughly 25-40% smaller
+// frames at equivalent visual quality. That's the real-world bandwidth
+// win available without paying for a genuine inter-frame video codec
+// (H.264 etc.), which the Pi 5 has no hardware encoder for anyway and
+// which would cost meaningfully more CPU for motion estimation.
+// ─────────────────────────────────────────────────────────────────────────────
+#include <webp/encode.h>
+
+class WebpEncoder {
+public:
+    explicit WebpEncoder(int quality) : quality_(quality) {}
+
+    // Encode a packed YUV420 frame (Y plane, then U, then V) to WebP bytes.
+    std::vector<uint8_t> encode(const uint8_t* yuv, int w, int h) {
+        WebPConfig config;
+        WebPConfigInit(&config);
+        WebPConfigPreset(&config, WEBP_PRESET_DEFAULT, static_cast<float>(quality_));
+        config.method = 0;  // fastest — this is a real-time stream, not archival quality
+
+        WebPPicture picture;
+        WebPPictureInit(&picture);
+        picture.width      = w;
+        picture.height     = h;
+        picture.use_argb   = 0;
+        picture.colorspace = WEBP_YUV420;
+        if (!WebPPictureAlloc(&picture)) return {};
+
+        // No MCU-alignment padding needed here (unlike JpegEncoder's
+        // raw-data path above) — WebPPictureAlloc handles arbitrary
+        // width/height and rounds the chroma planes internally.
+        const size_t   yBytes  = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const int      uvW     = w / 2, uvH = h / 2;
+        const size_t   uvBytes = static_cast<size_t>(uvW) * static_cast<size_t>(uvH);
+        const uint8_t* yPlane  = yuv;
+        const uint8_t* uPlane  = yuv + yBytes;
+        const uint8_t* vPlane  = uPlane + uvBytes;
+
+        for (int row = 0; row < h; ++row)
+            std::memcpy(picture.y + row * picture.y_stride,
+                        yPlane + static_cast<size_t>(row) * static_cast<size_t>(w),
+                        static_cast<size_t>(w));
+        for (int row = 0; row < uvH; ++row) {
+            std::memcpy(picture.u + row * picture.uv_stride,
+                        uPlane + static_cast<size_t>(row) * static_cast<size_t>(uvW),
+                        static_cast<size_t>(uvW));
+            std::memcpy(picture.v + row * picture.uv_stride,
+                        vPlane + static_cast<size_t>(row) * static_cast<size_t>(uvW),
+                        static_cast<size_t>(uvW));
+        }
+
+        WebPMemoryWriter writer;
+        WebPMemoryWriterInit(&writer);
+        picture.writer     = WebPMemoryWrite;
+        picture.custom_ptr = &writer;
+
+        std::vector<uint8_t> result;
+        if (WebPEncode(&config, &picture))
+            result.assign(writer.mem, writer.mem + writer.size);
+        WebPMemoryWriterClear(&writer);
+        WebPPictureFree(&picture);
+        return result;
+    }
+
+private:
+    int quality_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StreamHttpServer
 //
-// Serves a self-contained HTML page at "/" with <img src="/stream">, and
-// a multipart/x-mixed-replace MJPEG stream at "/stream". Every connected
-// browser tab is its own client thread; sendFrame() pushes the latest
-// JPEG to all of them. No JS, no signaling, no negotiation — this is the
-// format browsers have supported natively since the late 1990s.
+// No HTML page is served here (see the /stream handler's 404 fallback
+// below) — the web UI lives in picam-frontend, which proxies /stream and
+// /status.json. This server just does the multipart/x-mixed-replace
+// WebP stream at "/stream": every connected browser tab is its own
+// client thread, and sendFrameForSource() pushes the latest frame to
+// all clients watching that resolution. No JS, no signaling, no
+// negotiation on this server's side — <img src="/stream"> is a format
+// browsers have supported natively since the late 1990s; only the
+// per-frame image codec inside changed (JPEG → WebP).
 // ─────────────────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 // StreamSelector — shared atomic state for which source feeds the encoder.
@@ -1331,7 +1413,7 @@ static StreamSource parseStreamName(const std::string& s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MjpegHttpServer
+// StreamHttpServer
 //
 // Architecture: one encode per frame, broadcast to N clients.
 //
@@ -1343,22 +1425,22 @@ static StreamSource parseStreamName(const std::string& s) {
 // under the broadcast lock, so a slow or stalled client cannot block
 // the encoder or any other client.
 //
-// The write thread sends the MJPEG opening header immediately on
+// The write thread sends the multipart opening header immediately on
 // connect (before the first frame arrives), so the browser has a valid
 // HTTP response right away and starts rendering as soon as the first
-// JPEG lands.
+// WebP frame lands.
 // ─────────────────────────────────────────────────────────────────────────────
-using JpegFrame = std::shared_ptr<const std::vector<uint8_t>>;
+using EncodedFrame = std::shared_ptr<const std::vector<uint8_t>>;
 
 struct StreamClient {
     int        fd;
     StreamSource selected;           // per-client stream selection
     std::mutex              mu;
     std::condition_variable cv;
-    JpegFrame               latest;
-    bool                    closed = false;
+    EncodedFrame             latest;
+    bool                     closed = false;
     // Set false by the write-loop thread right before it exits. Lets the
-    // lock-free client list (see MjpegHttpServer) prune dead entries
+    // lock-free client list (see StreamHttpServer) prune dead entries
     // without needing weak_ptr/expired() checks, since the list now holds
     // plain shared_ptr in an immutable, atomically-swapped snapshot.
     std::atomic<bool>       alive{true};
@@ -1368,7 +1450,7 @@ struct StreamClient {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PipelineStatus — defined here (rather than near StatusServer further
-// down) because MjpegHttpServer's /status.json handler needs to read
+// down) because StreamHttpServer's /status.json handler needs to read
 // latest_frame_ts_us from it.
 // ─────────────────────────────────────────────────────────────────────────────
 struct PipelineStatus {
@@ -1390,12 +1472,12 @@ struct PipelineStatus {
 };
 static PipelineStatus g_pstatus;
 
-class MjpegHttpServer {
+class StreamHttpServer {
 public:
-    MjpegHttpServer(int port, StreamSource defaultStream)
+    StreamHttpServer(int port, StreamSource defaultStream)
         : port_(port), defaultStream_(defaultStream) {}
 
-    ~MjpegHttpServer() {
+    ~StreamHttpServer() {
         running_ = false;
         // close() alone does not reliably unblock another thread that's
         // blocked inside accept() on this fd. shutdown() first forces
@@ -1433,9 +1515,9 @@ public:
             // listening on. Fail loudly instead, especially since this
             // is the port picam-frontend (or any direct viewer) expects
             // to reach this backend on.
-            std::cerr << "[MJPEG] FATAL: bind() failed on port " << port_
+            std::cerr << "[Stream] FATAL: bind() failed on port " << port_
                       << ": " << std::strerror(errno) << "\n"
-                      << "[MJPEG] Is something else already using this port? "
+                      << "[Stream] Is something else already using this port? "
                       << "Check: sudo ss -tlnp | grep ':" << port_ << " '\n";
             ::close(fd_);
             fd_ = -1;
@@ -1443,8 +1525,8 @@ public:
             std::exit(1);
         }
         ::listen(fd_, 16);
-        acceptThread_ = std::thread(&MjpegHttpServer::acceptLoop, this);
-        std::cerr << "[MJPEG] Viewer: http://0.0.0.0:" << port_ << "\n";
+        acceptThread_ = std::thread(&StreamHttpServer::acceptLoop, this);
+        std::cerr << "[Stream] Viewer: http://0.0.0.0:" << port_ << "\n";
     }
 
     // Deliver a frame to every client currently watching `source`.
@@ -1452,8 +1534,8 @@ public:
     // on this path — which runs many times per second from the main
     // pipeline loop and was previously the dominant source of lock
     // contention severe enough to look like a deadlock under load.
-    void sendFrameForSource(StreamSource source, const std::vector<uint8_t>& jpeg) {
-        auto frame = std::make_shared<const std::vector<uint8_t>>(jpeg);
+    void sendFrameForSource(StreamSource source, const std::vector<uint8_t>& webp) {
+        auto frame = std::make_shared<const std::vector<uint8_t>>(webp);
         auto snapshot = std::atomic_load(&clients_);
         for (auto& sp : *snapshot) {
             if (!sp->alive.load()) continue;
@@ -1576,7 +1658,7 @@ private:
 
         // /select is now stream-agnostic at the server level — it targets
         // a specific client identified by a ?client= token embedded in
-        // the MJPEG src URL. However for simplicity we accept a plain
+        // the stream src URL. However for simplicity we accept a plain
         // /select?stream=X POST from the browser JS; the JS on the page
         // reloads the <img src> with ?stream=X to attach to the right feed.
         if (path == "/select") {
@@ -1764,7 +1846,7 @@ private:
             // connections again. Reading clientCount() here is lock-free
             // (just an atomic load), so this check is essentially free.
             if (clientCount() >= 50) {
-                std::cerr << "\n[MJPEG] Rejecting connection — at client cap (50)\n";
+                std::cerr << "\n[Stream] Rejecting connection — at client cap (50)\n";
                 sendSimple(cfd, 503, "text/plain", "Too many connections");
                 ::close(cfd);
                 return;
@@ -1785,11 +1867,11 @@ private:
 
             auto client = std::make_shared<StreamClient>(cfd, src);
             registerClient(client);  // the only place that briefly locks anything
-            std::cerr << "\n[MJPEG] Client connected stream="
+            std::cerr << "\n[Stream] Client connected stream="
                       << streamName(src) << " total=" << clientCount() << "\n";
 
             while (true) {
-                JpegFrame frame;
+                EncodedFrame frame;
                 bool needKeepalive = false;
                 {
                     std::unique_lock<std::mutex> clk(client->mu);
@@ -1833,7 +1915,7 @@ private:
                 }
                 char partHdr[128];
                 int phLen = snprintf(partHdr, sizeof(partHdr),
-                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                    "--frame\r\nContent-Type: image/webp\r\nContent-Length: %zu\r\n\r\n",
                     frame->size());
                 bool ok =
                     ::send(cfd, partHdr, (size_t)phLen, MSG_NOSIGNAL) > 0 &&
@@ -1844,7 +1926,7 @@ private:
 
             client->alive.store(false);  // next registerClient() call will prune this entry
             ::close(cfd);
-            std::cerr << "\n[MJPEG] Client disconnected\n";
+            std::cerr << "\n[Stream] Client disconnected\n";
             return;
         }
 
@@ -1895,7 +1977,7 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // Status — for a simple TCP status query, same pattern as the other tools.
 // PipelineStatus/g_pstatus are defined earlier in the file (before
-// MjpegHttpServer) since /status.json's handler needs to read from it too.
+// StreamHttpServer) since /status.json's handler needs to read from it too.
 // ─────────────────────────────────────────────────────────────────────────────
 class StatusServer {
 public:
@@ -1992,8 +2074,11 @@ int main(int argc, char** argv) {
 
     const int delay_ms = cfg.get_int("delay.delay_ms", 1000);
 
-    const int jpeg_quality   = cfg.get_int("encode.jpeg_quality", 80);
-    const int output_fps_live= cfg.get_int("encode.output_fps_live", 15);
+    // WebP for the live stream (see WebpEncoder); JPEG is still used only
+    // for EventRecorder's saved snapshot files, not the stream itself.
+    const int webp_quality     = cfg.get_int("encode.webp_quality", 80);
+    const int jpeg_quality     = cfg.get_int("encode.jpeg_quality", 80);
+    const int output_fps_live  = cfg.get_int("encode.output_fps_live", 15);
     const int output_fps_annot = cfg.get_int("encode.output_fps_annotated", 30);
 
     // OSD: burns camera ID and/or wall-clock timestamp directly into the
@@ -2043,7 +2128,8 @@ int main(int argc, char** argv) {
               << "[Config] recorder  : tcp://" << rec_host << ":" << rec_port << "\n"
               << "[Config] telemetry : tcp://" << tel_host << ":" << tel_port << "\n"
               << "[Config] delay     : " << delay_ms << "ms (applied to whichever resolution has annotation on)\n"
-              << "[Config] encode    : jpeg quality=" << jpeg_quality
+              << "[Config] encode    : webp quality=" << webp_quality
+              << "  (snapshot jpeg quality=" << jpeg_quality << ")"
               << "  live_fps=" << output_fps_live
               << "  annotated_fps=" << output_fps_annot << "\n"
               << "[Config] osd       : camera_id=" << (g_osd_camera_id_enabled.load() ? "enabled" : "disabled")
@@ -2069,11 +2155,10 @@ int main(int argc, char** argv) {
     DelayBuffer mainDelayBuf(delay_ms);
     DelayBuffer loresDelayBuf(delay_ms);
 
-    // ── MJPEG HTTP server + encoder — constructed before the receivers
-    // below since their frame callbacks reference mjpeg.clientCount()
-    // to decide whether to do the latest-frame mailbox copy at all. ──────
-    MjpegHttpServer mjpeg(http_port, defaultSrc);
-    JpegEncoder      encoder(jpeg_quality);
+    // ── Stream HTTP server — constructed before the receivers below
+    // since their frame callbacks reference streamSrv.clientCount() to
+    // decide whether to do the latest-frame mailbox copy at all. ────────
+    StreamHttpServer streamSrv(http_port, defaultSrc);
 
     UdpRawReceiver mainReceiver(raw_host, main_port, main_width, main_height, ping_every,
         [&](RawFrame f) {
@@ -2083,7 +2168,7 @@ int main(int argc, char** argv) {
             }
             // Always keep the main mailbox warm, unconditionally. The
             // previous "only copy if a client is watching" gate called
-            // mjpeg.clientCountForSource() from this UDP receive callback,
+            // streamSrv.clientCountForSource() from this UDP receive callback,
             // which fires up to 30x/second — adding lock contention to a
             // hot path for a marginal copy-avoidance win. Worse, it created
             // a startup race: a freshly connected client had to wait for
@@ -2138,7 +2223,7 @@ int main(int argc, char** argv) {
     loresReceiver.start();
     detReceiver.start();
     telReceiver.start();
-    mjpeg.start();
+    streamSrv.start();
 
     std::cerr << "[Main] Waiting for raw streams...\n";
     if (!mainReceiver.waitForStream(30))
@@ -2174,8 +2259,8 @@ int main(int argc, char** argv) {
     // Two encoders — one per resolution. Each is reused whether that
     // resolution is currently live or annotated, since only one of those
     // two states is ever active for a given resolution at a time.
-    JpegEncoder mainEncoder(jpeg_quality);
-    JpegEncoder loresEncoder(jpeg_quality);
+    WebpEncoder mainEncoder(webp_quality);
+    WebpEncoder loresEncoder(webp_quality);
 
     while (!g_stop) {
         auto now = Clock::now();
@@ -2185,7 +2270,7 @@ int main(int argc, char** argv) {
 
         // Single lock acquisition per iteration instead of one per stream
         // (see snapshotCounts() comment for why this matters).
-        auto counts = mjpeg.snapshotCounts();
+        auto counts = streamSrv.snapshotCounts();
 
         // ── Main ──────────────────────────────────────────────────────────────
         bool mainAnnotated = g_main_annotated.load();
@@ -2224,8 +2309,8 @@ int main(int argc, char** argv) {
                              frame.timestampUs,
                              osd_camera_label(frame.cameraIndex),
                              g_osd_camera_id_enabled.load(), g_osd_time_enabled.load());
-                auto jpeg = mainEncoder.encode(frame.data.data(), frame.width, frame.height);
-                mjpeg.sendFrameForSource(StreamSource::Main, jpeg);
+                auto webp = mainEncoder.encode(frame.data.data(), frame.width, frame.height);
+                streamSrv.sendFrameForSource(StreamSource::Main, webp);
                 last_main_time = now;
                 did_work = true;
                 newest_ts_us = frame.timestampUs;
@@ -2268,8 +2353,8 @@ int main(int argc, char** argv) {
                              frame.timestampUs,
                              osd_camera_label(frame.cameraIndex),
                              g_osd_camera_id_enabled.load(), g_osd_time_enabled.load());
-                auto jpeg = loresEncoder.encode(frame.data.data(), frame.width, frame.height);
-                mjpeg.sendFrameForSource(StreamSource::Lores, jpeg);
+                auto webp = loresEncoder.encode(frame.data.data(), frame.width, frame.height);
+                streamSrv.sendFrameForSource(StreamSource::Lores, webp);
                 last_lores_time = now;
                 did_work = true;
                 newest_ts_us = frame.timestampUs;

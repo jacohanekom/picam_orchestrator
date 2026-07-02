@@ -5,15 +5,18 @@ Maintainer: Jaco Hanekom <jhanekom@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cmake,
                pkg-config,
-               libjpeg-dev
+               libjpeg-dev,
+               libwebp-dev
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
 Package: picam-orchestrator
 Architecture: arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}, picam-raw, picam-hailo
-Description: MJPEG stream + camera control backend for picam-raw + picam-hailo
- Headless backend exposing Main / Lores / Annotated MJPEG streams over
+Description: WebP stream + camera control backend for picam-raw + picam-hailo
+ Headless backend exposing Main / Lores / Annotated live video streams
+ (multipart/x-mixed-replace WebP, not MJPEG — ~25-40% less bandwidth
+ than JPEG at equivalent quality, same <img>-tag-friendly delivery) over
  plain HTTP (/stream?stream=main|lores|annotated), a JSON status
  endpoint (/status.json), an on-the-fly OSD toggle (/osd), and a
  camera-switch proxy to picam-raw (/camera?id=N). No web interface of
@@ -21,7 +24,7 @@ Description: MJPEG stream + camera control backend for picam-raw + picam-hailo
  Main and Lores are live feeds straight from picam-raw; Annotated
  buffers the main stream for ~1 second, matches detections from
  picam-hailo by timestamp, and draws bounding boxes onto the delayed
- frames.
+ frames. Event snapshot files saved to disk are still plain JPEG.
  .
  Install picam-frontend on one machine to get a browser UI that can
  view, switch streams/cameras, and toggle the OSD across multiple
